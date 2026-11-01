@@ -12,6 +12,7 @@ import os
 import shutil
 import sys
 import time
+import uuid
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import gi  # noqa: E402
@@ -266,15 +267,19 @@ class Editor(Gtk.Application):
         self._loading = False
 
     def _discard_edits(self):
-        """Drop widget edits: re-read the book and rebuild the UI from disk."""
-        self.dirty = False
+        """Drop widget edits: re-read the book and rebuild the UI from disk.
+
+        Returns False when the book cannot be re-read; the caller must then keep
+        the unsaved edits and stop switching instead of silently forgetting them.
+        """
         try:
             book = nb.load_book(self.root)
         except nb.NotebookError as e:
             self.status.set_text(str(e))
-            return
+            return False
         if book is None:
-            return
+            self.status.set_text('笔记库不存在，未放弃修改')
+            return False
         self.book = book
         self.revision = book['revision']
         cid = self.chapter_id
@@ -286,6 +291,8 @@ class Editor(Gtk.Application):
         ids = [e['id'] for e in self.chapter_entries(cid)]
         keep = self.current_id if self.current_id in ids else (ids[0] if ids else None)
         self._fill_entries(cid, keep)
+        self.dirty = False
+        return True
 
     def chapters(self):
         return self.book['chapters'] if self.book else []
@@ -444,7 +451,7 @@ class Editor(Gtk.Application):
 
     def _store_image(self, src, kind):
         ext = os.path.splitext(src)[1].lower() or '.png'
-        name = f'{kind}-{self.current_id}-{int(time.time() * 1000)}{ext}'
+        name = f'{kind}-{self.current_id}-{uuid.uuid4().hex}{ext}'
         images = os.path.join(self.root, 'images')
         os.makedirs(images, exist_ok=True)
         shutil.copy2(src, os.path.join(images, name))
@@ -905,7 +912,7 @@ class Editor(Gtk.Application):
             except GLib.Error:
                 tex = None
             if tex is not None:
-                name = f'body-{self.current_id}-{int(time.time() * 1000)}.png'
+                name = f'body-{self.current_id}-{uuid.uuid4().hex}.png'
                 images = os.path.join(self.root, 'images')
                 os.makedirs(images, exist_ok=True)
                 try:
@@ -1041,7 +1048,8 @@ class Editor(Gtk.Application):
                     return
             else:
                 # drop the edits for real: the in-memory book already has them
-                self._discard_edits()
+                if not self._discard_edits():
+                    return
             self.dirty = False
             proceed()
 
