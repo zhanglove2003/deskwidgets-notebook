@@ -1,0 +1,46 @@
+{
+    "id": "album",
+    "version": "1.0",
+    "author": "snow",
+    "category": "personal",
+    "name": {
+        "en": "Picture notebook",
+        "zh": "图文笔记"
+    },
+    "description": {
+        "en": "Chapters, covers and picture-and-text notes: wheel to turn pages, click to edit",
+        "zh": "章节、封面与图文笔记：滚轮翻页，点击编辑"
+    },
+    "sizes": ["small", "medium", "large"],
+    "interval": 0.1,
+    "options": [
+        {
+            "key": "folder",
+            "type": "text",
+            "default": "",
+            "label": { "en": "First import folder", "zh": "首次导入目录" },
+            "hint": { "en": "Used once, when the notebook is created; later add pictures in the editor", "zh": "只在笔记库还不存在时导入一次；以后请在编辑窗里添加图片" }
+        },
+        {
+            "key": "fit",
+            "type": "choice",
+            "default": "cover",
+            "label": { "en": "Cover fit", "zh": "封面填充方式" },
+            "hint": { "en": "How the cover picture fills the card area", "zh": "封面在卡片图片区域的显示方式" },
+            "choices": [
+                { "value": "cover", "label": { "en": "Fill the card", "zh": "填满卡片" } },
+                { "value": "contain", "label": { "en": "Show it all", "zh": "完整显示" } }
+            ]
+        },
+        {
+            "key": "autoplay",
+            "type": "number",
+            "default": 0,
+            "min": 0,
+            "max": 120,
+            "step": 5,
+            "label": { "en": "Auto-rotate (sec, 0 = off)", "zh": "自动轮播（秒，0 = 关）" },
+            "hint": { "en": "Turns pages inside the current chapter only", "zh": "只在当前章节内翻页" }
+        }
+    ]
+}
