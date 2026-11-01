@@ -89,10 +89,19 @@ class Editor(Gtk.Application):
         entry = self.requested_entry
         chapter = self.requested_chapter
         self.requested_entry = self.requested_chapter = None
-        if chapter:
-            self._select_chapter(chapter)
-        if entry:
-            self._request_entry(entry)
+        if not (chapter or entry):
+            return
+
+        def apply():
+            if chapter:
+                self._select_chapter(chapter)
+            if entry:
+                self._request_entry(entry)
+
+        if self.dirty:
+            self._ask_unsaved(apply)
+        else:
+            apply()
 
     def _quit(self):
         if self._quitting:
@@ -255,6 +264,28 @@ class Editor(Gtk.Application):
         self._fill_chapters(chapter)
         self._fill_entries(chapter, entry_id or self.requested_entry or view.get('entry_id'))
         self._loading = False
+
+    def _discard_edits(self):
+        """Drop widget edits: re-read the book and rebuild the UI from disk."""
+        self.dirty = False
+        try:
+            book = nb.load_book(self.root)
+        except nb.NotebookError as e:
+            self.status.set_text(str(e))
+            return
+        if book is None:
+            return
+        self.book = book
+        self.revision = book['revision']
+        cid = self.chapter_id
+        if cid not in {c['id'] for c in self.chapters()}:
+            cid = self.chapters()[0]['id']
+        self._loading = True
+        self._fill_chapters(cid)
+        self._loading = False
+        ids = [e['id'] for e in self.chapter_entries(cid)]
+        keep = self.current_id if self.current_id in ids else (ids[0] if ids else None)
+        self._fill_entries(cid, keep)
 
     def chapters(self):
         return self.book['chapters'] if self.book else []
@@ -617,9 +648,20 @@ class Editor(Gtk.Application):
         cid = self.chapters()[idx]['id']
         if cid == self.chapter_id:
             return
-        self._sync()
-        self.chapter_id = cid
-        self._fill_entries(cid, None)
+
+        def switch():
+            self.chapter_id = cid
+            self._fill_entries(cid, None)
+
+        def restore():
+            self._loading = True
+            self._fill_chapters(self.chapter_id)
+            self._loading = False
+
+        if self.dirty:
+            self._ask_unsaved(switch, restore)
+        else:
+            switch()
 
     def _select_chapter(self, cid):
         if cid not in {c['id'] for c in self.chapters()}:
@@ -634,13 +676,20 @@ class Editor(Gtk.Application):
         if not title:
             self.status.set_text('先输入新章节名')
             return
-        c = {'id': nb.new_id('ch'), 'title': title}
-        self.book['chapters'].append(c)
-        self.chapter_entry.set_text('')
-        self._fill_chapters(c['id'])
-        self._fill_entries(c['id'], None)
-        self.dirty = True
-        self.status.set_text('章节已添加，点保存生效')
+
+        def create():
+            c = {'id': nb.new_id('ch'), 'title': title}
+            self.book['chapters'].append(c)
+            self.chapter_entry.set_text('')
+            self._fill_chapters(c['id'])
+            self._fill_entries(c['id'], None)
+            self.dirty = True
+            self.status.set_text('章节已添加，点保存生效')
+
+        if self.dirty:
+            self._ask_unsaved(create)
+        else:
+            create()
 
     def _on_rename_chapter(self, _b):
         title = self.chapter_entry.get_text().strip()
@@ -971,8 +1020,8 @@ class Editor(Gtk.Application):
         self._quit()
         return True
 
-    def _ask_unsaved(self, proceed):
-        dlg = Gtk.AlertDialog(message='有未保存的修改', detail='切换条目前要保存吗？')
+    def _ask_unsaved(self, proceed, on_cancel=None):
+        dlg = Gtk.AlertDialog(message='有未保存的修改', detail='离开当前编辑前要保存吗？')
         dlg.set_buttons(['取消', '放弃', '保存'])
         dlg.set_cancel_button(0)
         dlg.set_default_button(2)
@@ -983,11 +1032,16 @@ class Editor(Gtk.Application):
             except GLib.Error:
                 return
             if choice == 0:
+                if on_cancel:
+                    on_cancel()
                 return
             if choice == 2:
                 self._on_save(None)
                 if self.dirty:
                     return
+            else:
+                # drop the edits for real: the in-memory book already has them
+                self._discard_edits()
             self.dirty = False
             proceed()
 
