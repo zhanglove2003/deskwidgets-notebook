@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+*.deb
+*.v1.py
+notebook.v1.json
+images.v1.list
+backup-*/
+*.log
+.DS_Store
