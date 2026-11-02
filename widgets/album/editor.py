@@ -374,6 +374,7 @@ class Editor(Gtk.Application):
         self.body.set_top_margin(6)
         self.body.set_bottom_margin(6)
         self.body.get_buffer().connect('changed', self._mark_dirty)
+        self._wire_image_undo(self.body.get_buffer())
         key = Gtk.EventControllerKey()
         key.connect('key-pressed', self._on_body_key)
         self.body.add_controller(key)
@@ -573,6 +574,8 @@ class Editor(Gtk.Application):
         buf = self.body.get_buffer()
         buf.set_text('')
         self.anchors.clear()
+        self._img_stack = []
+        self._img_open = None
         for b in blocks or []:
             if b.get('type') == 'text':
                 buf.insert(buf.get_end_iter(), b.get('text') or '')
@@ -812,9 +815,10 @@ button.symbol-btn {
         buf.begin_user_action()
         if buf.get_has_selection():
             start, end = buf.get_selection_bounds()
-            text = buf.get_text(start, end, True)
-            buf.delete(start, end)
-            buf.insert_at_cursor(before + text + after)
+            end_off = end.get_offset()
+            start_off = start.get_offset()
+            buf.insert(buf.get_iter_at_offset(end_off), after)
+            buf.insert(buf.get_iter_at_offset(start_off), before)
         else:
             buf.insert_at_cursor(before + after)
             it = buf.get_iter_at_mark(buf.get_insert())
@@ -830,6 +834,96 @@ button.symbol-btn {
     def _redo(self, _b=None):
         self.body.get_buffer().redo()
         self._focus_body()
+
+    # GTK4 undo restores the \ufffc placeholder but not the child anchor, so
+    # deletions are recorded here and re-attached after an undo brings the
+    # placeholder characters back.
+    def _wire_image_undo(self, buf):
+        self._img_stack = []
+        self._img_open = None
+        self._repairing = False
+        self._repair_scheduled = False
+        buf.connect('begin-user-action', self._on_ua_begin)
+        buf.connect('end-user-action', self._on_ua_end)
+        buf.connect('delete-range', self._on_del_range)
+        buf.connect('changed', self._on_buf_changed)
+
+    def _on_ua_begin(self, _buf):
+        self._img_open = []
+
+    def _on_ua_end(self, _buf):
+        if self._img_open:
+            self._img_stack.append(self._img_open)
+        self._img_open = None
+
+    def _on_del_range(self, _buf, start, end):
+        it = start.copy()
+        while it.compare(end) < 0:
+            anchor = it.get_child_anchor()
+            if anchor is not None:
+                rel = self.anchors.get(anchor)
+                if rel:
+                    if self._img_open is None:
+                        self._img_open = []
+                    self._img_open.append(rel)
+            it.forward_char()
+        return False
+
+    def _on_buf_changed(self, buf):
+        # Repair must not run inside the undo operation that emitted this
+        # signal: mutating the buffer there invalidates GTK's own iterators.
+        if self._repair_scheduled:
+            return
+        self._repair_scheduled = True
+        GLib.idle_add(self._repair_idle)
+
+    def _repair_idle(self):
+        self._repair_scheduled = False
+        self._repair_images()
+        return False
+
+    def _take_deleted_rels(self, n):
+        stack = self._img_stack
+        if stack and len(stack[-1]) == n:
+            return stack.pop()
+        out = []
+        while len(out) < n and stack:
+            grp = stack[-1]
+            out.append(grp.pop())
+            if not grp:
+                stack.pop()
+        out.reverse()
+        return out
+
+    def _repair_images(self):
+        if self._repairing or not self._img_stack:
+            return
+        buf = self.body.get_buffer()
+        orphans = []
+        it = buf.get_start_iter()
+        while not it.is_end():
+            if it.get_char() == '\ufffc' and it.get_child_anchor() is None:
+                orphans.append(it.get_offset())
+            it.forward_char()
+        if not orphans:
+            return
+        rels = self._take_deleted_rels(len(orphans))
+        if not rels:
+            return
+        self._repairing = True
+        buf.begin_irreversible_action()
+        for off, rel in zip(reversed(orphans), reversed(rels)):
+            it = buf.get_iter_at_offset(off)
+            end = it.copy()
+            end.forward_char()
+            buf.delete(it, end)
+            anchor = buf.create_child_anchor(buf.get_iter_at_offset(off))
+            self.anchors[anchor] = rel
+            pic = self._picture_for(rel)
+            if pic is not None:
+                self.body.add_child_at_anchor(pic, anchor)
+        buf.end_irreversible_action()
+        self._repairing = False
 
     _PREFIX_RE = re.compile(
         r'^(\s*)(?:[①-⑳❶-❿⓵-⓾]\s*|\d{1,3}[.、)]\s*|[•●]\s*|[☐☑☒]\s*|▎\s*)')
@@ -873,27 +967,33 @@ button.symbol-btn {
         buf.begin_user_action()
         num = 0
         for ln in range(first, last + 1):
-            s, e, text = line_text(ln)
+            s, _e, text = line_text(ln)
             if not text.strip():
                 continue
-            stripped = self._PREFIX_RE.sub(lambda m: m.group(1), text)
+            m = self._PREFIX_RE.match(text)
+            indent = m.group(1) if m else ''
             if has:
-                out = stripped
+                ps = s.copy()
+                ps.forward_chars(len(indent))
+                pe = s.copy()
+                pe.forward_chars(m.end())
+                buf.delete(ps, pe)
+                continue
+            if kind == 'num':
+                num += 1
+                prefix = (self._CIRCLED[num - 1] if num <= len(self._CIRCLED)
+                          else f'{num}.')
+            elif kind == 'bullet':
+                prefix = '•'
+            elif kind == 'box':
+                prefix = '☐'
             else:
-                if kind == 'num':
-                    num += 1
-                    prefix = (self._CIRCLED[num - 1] if num <= len(self._CIRCLED)
-                              else f'{num}.')
-                elif kind == 'bullet':
-                    prefix = '•'
-                elif kind == 'box':
-                    prefix = '☐'
-                else:
-                    prefix = '▎'
-                out = prefix + ' ' + stripped
-            if out != text:
-                buf.delete(s, e)
-                buf.insert(s, out)
+                prefix = '▎'
+            if m and m.end() > 0:
+                pe = s.copy()
+                pe.forward_chars(m.end())
+                buf.delete(s, pe)
+            buf.insert(s, prefix + ' ' + indent)
         buf.end_user_action()
         self._focus_body()
 
