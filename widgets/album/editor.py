@@ -9,6 +9,7 @@ Usage: editor.py --instance ID [--entry EID] [--chapter CHID]
 """
 import argparse
 import os
+import re
 import shutil
 import sys
 import time
@@ -19,9 +20,132 @@ import gi  # noqa: E402
 
 gi.require_version('Gtk', '4.0')
 gi.require_version('Gdk', '4.0')
-from gi.repository import Gdk, Gio, GLib, Gtk  # noqa: E402
+gi.require_version('Pango', '1.0')
+from gi.repository import Gdk, Gio, GLib, Gtk, Pango  # noqa: E402
 
 import notebook as nb  # noqa: E402
+
+def _sym(symbol, keywords):
+    return (symbol, keywords, None)
+
+
+def _pair(label, keywords):
+    return (label, keywords, (label[0], label[1]))
+
+
+def _group(symbols, keywords):
+    return tuple(_sym(s, keywords) for s in symbols.split())
+
+
+def _numbered(symbols, kind, start=1):
+    return tuple(_sym(s, f'序号 圆形 数字 {i} {kind}')
+                 for i, s in enumerate(symbols, start))
+
+
+SYMBOL_GROUPS = (
+    ('常用', (
+        _sym('①', '常用 序号 圆形 数字 1'),
+        _sym('②', '常用 序号 圆形 数字 2'),
+        _sym('③', '常用 序号 圆形 数字 3'),
+        _sym('④', '常用 序号 圆形 数字 4'),
+        _sym('⑤', '常用 序号 圆形 数字 5'),
+        _sym('⑥', '常用 序号 圆形 数字 6'),
+        _sym('⑦', '常用 序号 圆形 数字 7'),
+        _sym('⑧', '常用 序号 圆形 数字 8'),
+        _sym('⑨', '常用 序号 圆形 数字 9'),
+        _sym('⑩', '常用 序号 圆形 数字 10'),
+        _sym('■', '常用 方框 黑色 方块'),
+        _sym('□', '常用 方框 白色 方块'),
+        _sym('☐', '常用 勾选 复选框 待办 空'),
+        _sym('☑', '常用 勾选 复选框 待办 已选'),
+        _sym('☒', '常用 勾选 复选框 取消'),
+        _sym('✓', '常用 勾选 对勾 正确'),
+        _sym('✗', '常用 勾选 叉 错误'),
+        _sym('•', '常用 列表 项目符号 圆点'),
+        _pair('“”', '常用 标点 引号 双引号'),
+        _pair('【】', '常用 标点 括号 方括号'),
+        _sym('—', '常用 标点 破折号'),
+        _sym('…', '常用 标点 省略号'),
+        _sym('→', '常用 箭头 右'),
+        _sym('★', '常用 标记 星'),
+    )),
+    ('序号',
+     _numbered('①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳', '带圈')
+     + _numbered('❶❷❸❹❺❻❼❽❾❿', '黑底')
+     + _numbered('⓵⓶⓷⓸⓹⓺⓻⓼⓽⓾', '双圈')),
+    ('方框与勾选',
+     _group('■ □ ▪ ▫ ▣ ▤ ▥ ▦ ▧ ▨ ▩ ◼ ◻ ◾ ◽', '方框 方块 方形')
+     + (
+         _sym('☐', '勾选 复选框 待办 空 未选'),
+         _sym('☑', '勾选 复选框 待办 已选 对勾'),
+         _sym('☒', '勾选 复选框 取消 叉'),
+         _sym('✓', '勾选 对勾 正确'),
+         _sym('✔', '勾选 对勾 正确 粗'),
+         _sym('✗', '勾选 叉 错误'),
+         _sym('✘', '勾选 叉 错误 粗'),
+     )),
+    ('标点与括号', (
+        _sym('、', '标点 中文 顿号'),
+        _sym('。', '标点 中文 句号'),
+        _sym('，', '标点 中文 逗号'),
+        _sym('；', '标点 中文 分号'),
+        _sym('：', '标点 中文 冒号'),
+        _sym('？', '标点 中文 问号'),
+        _sym('！', '标点 中文 感叹号'),
+        _sym('…', '标点 中文 省略号'),
+        _sym('——', '标点 中文 破折号'),
+        _sym('～', '标点 中文 波浪号'),
+        _sym('·', '标点 中文 间隔号'),
+        _pair('“”', '标点 中文 引号 双引号'),
+        _pair('‘’', '标点 中文 引号 单引号'),
+        _pair('「」', '标点 中文 引号 直角引号'),
+        _pair('『』', '标点 中文 引号 双直角引号'),
+        _pair('【】', '标点 中文 括号 方括号'),
+        _pair('《》', '标点 中文 书名号'),
+        _pair('〈〉', '标点 中文 括号 尖括号'),
+        _pair('（）', '标点 中文 括号 圆括号'),
+        _pair('〔〕', '标点 中文 括号 六角括号'),
+        _pair('［］', '标点 中文 括号 全角方括号'),
+        _pair('｛｝', '标点 中文 括号 花括号'),
+    )),
+    ('箭头与数学', (
+        _sym('→', '箭头 方向 右'),
+        _sym('←', '箭头 方向 左'),
+        _sym('↑', '箭头 方向 上'),
+        _sym('↓', '箭头 方向 下'),
+        _sym('⇒', '箭头 双线 右'),
+        _sym('⇐', '箭头 双线 左'),
+        _sym('⇔', '箭头 双向'),
+        _sym('➜', '箭头 实心 右'),
+        _sym('×', '数学 乘号'),
+        _sym('÷', '数学 除号'),
+        _sym('±', '数学 正负号'),
+        _sym('≈', '数学 约等号'),
+        _sym('≠', '数学 不等号'),
+        _sym('≤', '数学 小于等于'),
+        _sym('≥', '数学 大于等于'),
+        _sym('∞', '数学 无穷'),
+    )),
+    ('其他', (
+        _sym('•', '列表 项目符号 圆点'),
+        _sym('·', '列表 间隔点'),
+        _sym('‣', '列表 三角点'),
+        _sym('◦', '列表 空心点'),
+        _sym('⁃', '列表 短横点'),
+        _sym('∙', '列表 中点'),
+        _sym('※', '标记 参考 注释'),
+        _sym('§', '标记 章节'),
+        _sym('¶', '标记 段落'),
+        _sym('†', '标记 剑号'),
+        _sym('‡', '标记 双剑号'),
+        _sym('★', '标记 星 实心'),
+        _sym('☆', '标记 星 空心'),
+        _sym('✦', '标记 星 四角'),
+        _sym('✧', '标记 星 四角空心'),
+        _sym('♥', '标记 心 实心'),
+        _sym('♡', '标记 心 空心'),
+    )),
+)
 
 
 def widget_folder(instance):
@@ -115,6 +239,7 @@ class Editor(Gtk.Application):
 
     # UI ---------------------------------------------------------------------
     def _build(self):
+        self._editor_style()
         self.win = Gtk.ApplicationWindow(application=self, title='图文笔记 · ' + self.instance)
         self.win.set_default_size(920, 640)
         self.win.connect('close-request', self._on_close)
@@ -149,6 +274,7 @@ class Editor(Gtk.Application):
         left.append(b)
         scroll = Gtk.ScrolledWindow(vexpand=True)
         scroll.set_size_request(210, -1)
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
         self.listbox = Gtk.ListBox()
         self.listbox.set_activate_on_single_click(True)
         self.listbox.connect('row-activated', self._on_row_activated)
@@ -177,6 +303,9 @@ class Editor(Gtk.Application):
         b = Gtk.Button(label='清除封面'); b.connect('clicked', self._on_clear_cover)
         cover_row.append(b)
         self.cover_label = Gtk.Label(label='未设置时用正文第一张图', xalign=0)
+        self.cover_label.set_ellipsize(Pango.EllipsizeMode.MIDDLE)
+        self.cover_label.set_max_width_chars(36)
+        self.cover_label.set_hexpand(True)
         self.cover_label.add_css_class('dim-label')
         cover_row.append(self.cover_label)
         right.append(cover_row)
@@ -194,21 +323,56 @@ class Editor(Gtk.Application):
         cover_frame.set_child(thumb_view)
         right.append(cover_frame)
 
-        tools = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        b = Gtk.Button(label='插入图片…'); b.connect('clicked', self._on_insert_image)
-        tools.append(b)
-        hint = Gtk.Label(label='图片插在光标处，也可以直接粘贴或拖入正文', xalign=0)
-        hint.add_css_class('dim-label')
-        tools.append(hint)
+        tools = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        tools.set_margin_top(2)
+
+        def tool_btn(glyph, tip, cb):
+            b = Gtk.Button(label=glyph)
+            b.add_css_class('symbol-btn')
+            b.add_css_class('flat')
+            b.set_tooltip_text(tip)
+            b.connect('clicked', lambda _b, fn=cb: fn(_b))
+            tools.append(b)
+
+        def sep():
+            tools.append(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL))
+
+        tool_btn('↶', '撤销（Ctrl+Z）', self._undo)
+        tool_btn('↷', '重做（Ctrl+Shift+Z）', self._redo)
+        sep()
+        tool_btn('图', '插入图片：插在光标处，也可以直接粘贴或拖入正文',
+                 self._on_insert_image)
+        sep()
+        tool_btn('1.', '序号列表：给当前行或选中各行加编号，再点一次取消',
+                 lambda _b: self._toggle_prefix('num'))
+        tool_btn('•', '圆点列表：给当前行或选中各行加项目符号，再点一次取消',
+                 lambda _b: self._toggle_prefix('bullet'))
+        tool_btn('☐', '勾选清单：给当前行或选中各行加复选框，再点一次取消',
+                 lambda _b: self._toggle_prefix('box'))
+        tool_btn('❝', '引用：给当前行或选中各行加引用条，再点一次取消',
+                 lambda _b: self._toggle_prefix('quote'))
+        sep()
+        tool_btn('─', '分隔线：在光标处插入一条横线', lambda _b: self._insert_divider())
+
+        mb = Gtk.MenuButton(label='符号')
+        mb.set_tooltip_text('编号、方框、勾选、标点和更多符号')
+        mb.set_always_show_arrow(True)
+        mb.set_popover(self._symbol_popover())
+        tools.append(mb)
+
         right.append(tools)
 
         body_frame = Gtk.Frame(label='正文')
         body_frame.set_vexpand(True)
         body_scroll = Gtk.ScrolledWindow(vexpand=True)
-        self.body = Gtk.TextView(wrap_mode=Gtk.WrapMode.WORD_CHAR)
+        body_scroll.add_css_class('body-scroll')
+        body_scroll.set_policy(Gtk.PolicyType.ALWAYS, Gtk.PolicyType.AUTOMATIC)
+        body_scroll.set_overlay_scrolling(False)
+        self.body = Gtk.TextView(wrap_mode=Gtk.WrapMode.NONE)
         self.body.set_left_margin(8)
         self.body.set_right_margin(8)
         self.body.set_top_margin(6)
+        self.body.set_bottom_margin(6)
         self.body.get_buffer().connect('changed', self._mark_dirty)
         key = Gtk.EventControllerKey()
         key.connect('key-pressed', self._on_body_key)
@@ -338,8 +502,12 @@ class Editor(Gtk.Application):
         for e in entries:
             row = Gtk.ListBoxRow()
             row.entry_id = e['id']
-            label = Gtk.Label(label=e['title'] or '（无标题）', xalign=0,
+            title = e['title'] or '（无标题）'
+            label = Gtk.Label(label=title, xalign=0,
                               margin_top=6, margin_bottom=6, margin_start=8, margin_end=8)
+            label.set_ellipsize(Pango.EllipsizeMode.END)
+            label.set_hexpand(True)
+            label.set_tooltip_text(title)
             row.set_child(label)
             self.listbox.append(row)
             if e['id'] == target['id']:
@@ -461,13 +629,297 @@ class Editor(Gtk.Application):
         self.cover_thumb.set_paintable(None)
         if not e or not e.get('cover'):
             self.cover_label.set_text('未设置时用正文第一张图')
+            self.cover_label.set_tooltip_text(None)
             return
-        self.cover_label.set_text(e['cover'])
+        self.cover_label.set_text('已设置封面')
+        self.cover_label.set_tooltip_text(e['cover'])
         try:
             self.cover_thumb.set_paintable(
                 Gdk.Texture.new_from_filename(os.path.join(self.root, e['cover'])))
         except Exception:
             pass
+
+    # text toolbar -----------------------------------------------------------
+    _editor_css_done = False
+
+    def _editor_style(self):
+        if Editor._editor_css_done:
+            return
+        prov = Gtk.CssProvider()
+        prov.load_from_data(b'''
+button.symbol-btn {
+  min-width: 30px;
+  min-height: 30px;
+  padding: 0 4px;
+  font-size: 14pt;
+}
+.body-scroll scrollbar.vertical {
+  min-width: 14px;
+}
+.body-scroll scrollbar.vertical slider {
+  min-width: 10px;
+  min-height: 44px;
+  border-radius: 6px;
+}
+.body-scroll scrollbar.horizontal {
+  min-height: 14px;
+}
+.body-scroll scrollbar.horizontal slider {
+  min-height: 10px;
+  min-width: 44px;
+  border-radius: 6px;
+}
+.symbol-section {
+  font-weight: bold;
+  margin-top: 2px;
+}
+.symbol-popover scrollbar.vertical {
+  min-width: 14px;
+}
+.symbol-popover scrollbar.vertical slider {
+  min-width: 10px;
+  min-height: 44px;
+  border-radius: 6px;
+}
+''')
+        Gtk.StyleContext.add_provider_for_display(
+            Gdk.Display.get_default(), prov, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+        Editor._editor_css_done = True
+
+    def _symbol_popover(self):
+        pop = Gtk.Popover()
+        pop.add_css_class('symbol-popover')
+        pop.set_has_arrow(False)
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8,
+                        margin_top=10, margin_bottom=10, margin_start=10, margin_end=10)
+        outer.set_size_request(560, -1)
+        self._symbol_search = Gtk.SearchEntry(
+            placeholder_text='搜索符号：序号、勾选、箭头…')
+        self._symbol_search.connect('search-changed', self._filter_symbols)
+        outer.append(self._symbol_search)
+
+        self._symbol_scroll = Gtk.ScrolledWindow()
+        self._symbol_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        self._symbol_scroll.set_overlay_scrolling(False)
+        self._symbol_scroll.set_max_content_height(300)
+        self._symbol_scroll.set_propagate_natural_height(True)
+        content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        self._symbol_sections = []
+        for title, items in SYMBOL_GROUPS:
+            label = Gtk.Label(label=title, xalign=0)
+            label.add_css_class('symbol-section')
+            flow = Gtk.FlowBox()
+            flow.set_selection_mode(Gtk.SelectionMode.NONE)
+            flow.set_homogeneous(True)
+            flow.set_max_children_per_line(8)
+            flow.set_row_spacing(4)
+            flow.set_column_spacing(4)
+            flow.set_valign(Gtk.Align.START)
+            entries = []
+            for sym, keywords, pair in items:
+                b = Gtk.Button(label=sym)
+                b.add_css_class('symbol-btn')
+                b.add_css_class('flat')
+                b.set_tooltip_text(
+                    ('包裹选中文字：' + sym) if pair else ('插入 ' + sym))
+                if pair:
+                    b.connect('clicked', lambda _b, p=pair: self._symbol_insert_pair(p, pop))
+                else:
+                    b.connect('clicked', lambda _b, s=sym: self._symbol_insert(s, pop))
+                flow.append(b)
+                entries.append((b, keywords))
+            content.append(label)
+            content.append(flow)
+            self._symbol_sections.append((title, label, flow, entries))
+        self._symbol_empty = Gtk.Label(label='没有找到匹配的符号', xalign=0)
+        self._symbol_empty.add_css_class('dim-label')
+        self._symbol_empty.set_visible(False)
+        content.append(self._symbol_empty)
+        self._symbol_scroll.set_child(content)
+        outer.append(self._symbol_scroll)
+
+        hint = Gtk.Label(label='引号/括号：选中文字时包裹，未选中时插入一对', xalign=0)
+        hint.add_css_class('dim-label')
+        outer.append(hint)
+        pop.set_child(outer)
+        pop.connect('map', self._symbol_opened)
+        return pop
+
+    def _symbol_opened(self, _pop):
+        self._symbol_search.set_text('')
+        self._filter_symbols(self._symbol_search)
+        adj = self._symbol_scroll.get_vadjustment()
+        if adj is not None:
+            adj.set_value(0)
+        GLib.idle_add(self._symbol_focus_search)
+
+    def _symbol_focus_search(self):
+        self._symbol_search.grab_focus()
+        return False
+
+    def _filter_symbols(self, entry):
+        q = entry.get_text().strip().lower()
+        any_visible = False
+        for title, label, flow, entries in self._symbol_sections:
+            common_hidden = bool(q) and title == '常用' and '常用' not in q
+            matched = []
+            if not common_hidden:
+                for button, keywords in entries:
+                    text = (keywords + ' ' + (button.get_label() or '')).lower()
+                    if not q or q in text:
+                        matched.append(button)
+            child = flow.get_first_child()
+            while child is not None:
+                nxt = child.get_next_sibling()
+                flow.remove(child)
+                child = nxt
+            for button in matched:
+                flow.append(button)
+            label.set_visible(bool(matched))
+            flow.set_visible(bool(matched))
+            any_visible = any_visible or bool(matched)
+        self._symbol_empty.set_visible(not any_visible)
+        adj = self._symbol_scroll.get_vadjustment()
+        if adj is not None:
+            adj.set_value(0)
+
+    def _symbol_insert(self, sym, pop):
+        pop.popdown()
+        self._insert_text(sym)
+
+    def _symbol_insert_pair(self, pair, pop):
+        pop.popdown()
+        self._surround(*pair)
+
+    def _insert_text(self, text):
+        if not self.current_id:
+            self.status.set_text('先选择一条笔记')
+            return
+        buf = self.body.get_buffer()
+        buf.begin_user_action()
+        if buf.get_has_selection():
+            start, end = buf.get_selection_bounds()
+            buf.delete(start, end)
+        buf.insert_at_cursor(text)
+        buf.end_user_action()
+        self._focus_body()
+
+    def _surround(self, before, after):
+        if not self.current_id:
+            self.status.set_text('先选择一条笔记')
+            return
+        buf = self.body.get_buffer()
+        buf.begin_user_action()
+        if buf.get_has_selection():
+            start, end = buf.get_selection_bounds()
+            text = buf.get_text(start, end, True)
+            buf.delete(start, end)
+            buf.insert_at_cursor(before + text + after)
+        else:
+            buf.insert_at_cursor(before + after)
+            it = buf.get_iter_at_mark(buf.get_insert())
+            it.backward_chars(len(after))
+            buf.place_cursor(it)
+        buf.end_user_action()
+        self._focus_body()
+
+    def _undo(self, _b=None):
+        self.body.get_buffer().undo()
+        self._focus_body()
+
+    def _redo(self, _b=None):
+        self.body.get_buffer().redo()
+        self._focus_body()
+
+    _PREFIX_RE = re.compile(
+        r'^(\s*)(?:[①-⑳❶-❿⓵-⓾]\s*|\d{1,3}[.、)]\s*|[•●]\s*|[☐☑☒]\s*|▎\s*)')
+    _KIND_RES = {
+        'num': re.compile(r'^\s*(?:[①-⑳❶-❿⓵-⓾]\s*|\d{1,3}[.、)]\s*)'),
+        'bullet': re.compile(r'^\s*[•●]\s*'),
+        'box': re.compile(r'^\s*[☐☑☒]\s*'),
+        'quote': re.compile(r'^\s*▎\s*'),
+    }
+    _CIRCLED = '①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳'
+
+    def _toggle_prefix(self, kind):
+        if not self.current_id:
+            self.status.set_text('先选择一条笔记')
+            return
+        buf = self.body.get_buffer()
+        sel = buf.get_selection_bounds()
+        if sel:
+            first = sel[0].get_line()
+            last = sel[1].get_line()
+            if sel[1].starts_line() and last > first:
+                last -= 1
+        else:
+            first = last = buf.get_iter_at_mark(buf.get_insert()).get_line()
+
+        def line_text(ln):
+            s = buf.get_iter_at_line(ln)[1]
+            e = s.copy()
+            e.forward_to_line_end()
+            return s, e, buf.get_text(s, e, False)
+
+        has = False
+        kind_re = self._KIND_RES[kind]
+        for ln in range(first, last + 1):
+            _s, _e, text = line_text(ln)
+            if text.strip() and not kind_re.match(text):
+                break
+        else:
+            has = True
+
+        buf.begin_user_action()
+        num = 0
+        for ln in range(first, last + 1):
+            s, e, text = line_text(ln)
+            if not text.strip():
+                continue
+            stripped = self._PREFIX_RE.sub(lambda m: m.group(1), text)
+            if has:
+                out = stripped
+            else:
+                if kind == 'num':
+                    num += 1
+                    prefix = (self._CIRCLED[num - 1] if num <= len(self._CIRCLED)
+                              else f'{num}.')
+                elif kind == 'bullet':
+                    prefix = '•'
+                elif kind == 'box':
+                    prefix = '☐'
+                else:
+                    prefix = '▎'
+                out = prefix + ' ' + stripped
+            if out != text:
+                buf.delete(s, e)
+                buf.insert(s, out)
+        buf.end_user_action()
+        self._focus_body()
+
+    def _insert_divider(self):
+        if not self.current_id:
+            self.status.set_text('先选择一条笔记')
+            return
+        buf = self.body.get_buffer()
+        it = buf.get_iter_at_mark(buf.get_insert())
+        line_start = buf.get_iter_at_line(it.get_line())[1]
+        before = buf.get_text(line_start, it, False).strip()
+        text = ('\n' if before else '') + '─' * 20 + '\n'
+        buf.begin_user_action()
+        buf.insert(it, text)
+        buf.end_user_action()
+        self._focus_body()
+
+    def _focus_body(self):
+        GLib.idle_add(self._focus_body_idle)
+
+    def _focus_body_idle(self):
+        self.body.grab_focus()
+        buf = self.body.get_buffer()
+        it = buf.get_iter_at_mark(buf.get_insert())
+        self.body.scroll_to_iter(it, 0.0, False, 0.0, 0.0)
+        return False
 
     # picture viewer ---------------------------------------------------------
     _viewer_css_done = False
@@ -870,7 +1322,7 @@ class Editor(Gtk.Application):
         self._mark_dirty()
         return True
 
-    def _on_insert_image(self, _b):
+    def _on_insert_image(self, _b=None):
         if not self.current_id:
             self.status.set_text('先选择一条笔记')
             return
@@ -937,6 +1389,7 @@ class Editor(Gtk.Application):
             if text:
                 self.body.get_buffer().insert_at_cursor(text)
                 self._mark_dirty()
+                self._focus_body()
 
         cb.read_text_async(None, got)
 
