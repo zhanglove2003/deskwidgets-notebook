@@ -374,7 +374,7 @@ class Editor(Gtk.Application):
         self.body.set_top_margin(6)
         self.body.set_bottom_margin(6)
         self.body.get_buffer().connect('changed', self._mark_dirty)
-        self._wire_image_undo(self.body.get_buffer())
+        self._wire_history(self.body.get_buffer())
         key = Gtk.EventControllerKey()
         key.connect('key-pressed', self._on_body_key)
         self.body.add_controller(key)
@@ -574,8 +574,10 @@ class Editor(Gtk.Application):
         buf = self.body.get_buffer()
         buf.set_text('')
         self.anchors.clear()
-        self._img_stack = []
-        self._img_open = None
+        self._undo_stack = []
+        self._redo_stack = []
+        self._pre_snap = None
+        self._last_snap = self._snapshot()
         for b in blocks or []:
             if b.get('type') == 'text':
                 buf.insert(buf.get_end_iter(), b.get('text') or '')
@@ -828,102 +830,110 @@ button.symbol-btn {
         self._focus_body()
 
     def _undo(self, _b=None):
-        self.body.get_buffer().undo()
-        self._focus_body()
+        self._history_undo()
 
     def _redo(self, _b=None):
-        self.body.get_buffer().redo()
-        self._focus_body()
+        self._history_redo()
 
-    # GTK4 undo restores the \ufffc placeholder but not the child anchor, so
-    # deletions are recorded here and re-attached after an undo brings the
-    # placeholder characters back.
-    def _wire_image_undo(self, buf):
-        self._img_stack = []
-        self._img_open = None
-        self._repairing = False
-        self._repair_scheduled = False
-        buf.connect('begin-user-action', self._on_ua_begin)
-        buf.connect('end-user-action', self._on_ua_end)
-        buf.connect('delete-range', self._on_del_range)
-        buf.connect('changed', self._on_buf_changed)
+    # GTK4's built-in undo keeps only the \ufffc placeholder when a child
+    # anchor is deleted, and both irreversible actions and the enable-undo
+    # toggle wipe the whole history, so the body buffer runs its own
+    # snapshot-based undo stack instead.
+    def _wire_history(self, buf):
+        buf.set_enable_undo(False)
+        self._undo_stack = []
+        self._redo_stack = []
+        self._pre_snap = None
+        self._last_snap = None
+        self._restoring = False
+        self._micro_scheduled = False
+        buf.connect('begin-user-action', self._on_hist_begin)
+        buf.connect('end-user-action', self._on_hist_end)
+        buf.connect('changed', self._on_hist_changed)
 
-    def _on_ua_begin(self, _buf):
-        self._img_open = []
-
-    def _on_ua_end(self, _buf):
-        if self._img_open:
-            self._img_stack.append(self._img_open)
-        self._img_open = None
-
-    def _on_del_range(self, _buf, start, end):
-        it = start.copy()
-        while it.compare(end) < 0:
-            anchor = it.get_child_anchor()
-            if anchor is not None:
-                rel = self.anchors.get(anchor)
-                if rel:
-                    if self._img_open is None:
-                        self._img_open = []
-                    self._img_open.append(rel)
-            it.forward_char()
-        return False
-
-    def _on_buf_changed(self, buf):
-        # Repair must not run inside the undo operation that emitted this
-        # signal: mutating the buffer there invalidates GTK's own iterators.
-        if self._repair_scheduled:
-            return
-        self._repair_scheduled = True
-        GLib.idle_add(self._repair_idle)
-
-    def _repair_idle(self):
-        self._repair_scheduled = False
-        self._repair_images()
-        return False
-
-    def _take_deleted_rels(self, n):
-        stack = self._img_stack
-        if stack and len(stack[-1]) == n:
-            return stack.pop()
-        out = []
-        while len(out) < n and stack:
-            grp = stack[-1]
-            out.append(grp.pop())
-            if not grp:
-                stack.pop()
-        out.reverse()
-        return out
-
-    def _repair_images(self):
-        if self._repairing or not self._img_stack:
-            return
+    def _snapshot(self):
         buf = self.body.get_buffer()
-        orphans = []
+        text, imgs = [], []
         it = buf.get_start_iter()
         while not it.is_end():
-            if it.get_char() == '\ufffc' and it.get_child_anchor() is None:
-                orphans.append(it.get_offset())
+            anchor = it.get_child_anchor()
+            rel = self.anchors.get(anchor) if anchor is not None else None
+            if rel:
+                imgs.append((it.get_offset(), rel))
+            elif anchor is None:
+                text.append(it.get_char())
             it.forward_char()
-        if not orphans:
+        cur = buf.get_iter_at_mark(buf.get_insert()).get_offset()
+        return (''.join(text), tuple(imgs), cur)
+
+    def _same_snap(self, a, b):
+        return a is not None and b is not None and a == b
+
+    def _on_hist_begin(self, _buf):
+        self._pre_snap = self._snapshot()
+
+    def _on_hist_end(self, _buf):
+        pre = self._pre_snap if self._pre_snap is not None else self._last_snap
+        cur = self._snapshot()
+        self._pre_snap = None
+        self._last_snap = cur
+        self._micro_scheduled = False
+        if not self._same_snap(pre, cur):
+            self._undo_stack.append(pre)
+            self._redo_stack.clear()
+
+    def _on_hist_changed(self, _buf):
+        # Edits outside any user action (typing, IME, paste) become one
+        # coalesced history entry via an idle callback.
+        if self._restoring or self._pre_snap is not None or self._micro_scheduled:
             return
-        rels = self._take_deleted_rels(len(orphans))
-        if not rels:
+        self._micro_scheduled = True
+        pre = self._last_snap if self._last_snap is not None else self._snapshot()
+        GLib.idle_add(self._micro_commit, pre)
+
+    def _micro_commit(self, pre):
+        self._micro_scheduled = False
+        if self._restoring or self._pre_snap is not None:
+            return False
+        cur = self._snapshot()
+        self._last_snap = cur
+        if not self._same_snap(pre, cur):
+            self._undo_stack.append(pre)
+            self._redo_stack.clear()
+        return False
+
+    def _history_undo(self):
+        if self._restoring or not self._undo_stack:
             return
-        self._repairing = True
-        buf.begin_irreversible_action()
-        for off, rel in zip(reversed(orphans), reversed(rels)):
-            it = buf.get_iter_at_offset(off)
-            end = it.copy()
-            end.forward_char()
-            buf.delete(it, end)
-            anchor = buf.create_child_anchor(buf.get_iter_at_offset(off))
+        self._redo_stack.append(self._snapshot())
+        self._apply_snap(self._undo_stack.pop())
+        self._focus_body()
+
+    def _history_redo(self):
+        if self._restoring or not self._redo_stack:
+            return
+        self._undo_stack.append(self._snapshot())
+        self._apply_snap(self._redo_stack.pop())
+        self._focus_body()
+
+    def _apply_snap(self, snap):
+        self._restoring = True
+        buf = self.body.get_buffer()
+        buf.set_text('')
+        self.anchors.clear()
+        text, imgs, cur = snap
+        buf.insert(buf.get_start_iter(), text)
+        for k, (off, rel) in enumerate(imgs):
+            anchor = buf.create_child_anchor(buf.get_iter_at_offset(off - k))
             self.anchors[anchor] = rel
             pic = self._picture_for(rel)
             if pic is not None:
                 self.body.add_child_at_anchor(pic, anchor)
-        buf.end_irreversible_action()
-        self._repairing = False
+        behind = sum(1 for off, _r in imgs if off < cur)
+        buf.place_cursor(buf.get_iter_at_offset(cur - behind))
+        self._last_snap = self._snapshot()
+        self._micro_scheduled = False
+        self._restoring = False
 
     _PREFIX_RE = re.compile(
         r'^(\s*)(?:[①-⑳❶-❿⓵-⓾]\s*|\d{1,3}[.、)]\s*|[•●]\s*|[☐☑☒]\s*|▎\s*)')
@@ -950,10 +960,17 @@ button.symbol-btn {
             first = last = buf.get_iter_at_mark(buf.get_insert()).get_line()
 
         def line_text(ln):
+            # get_text() skips anchor chars, which would shift every offset
+            # on image lines; scan chars manually so positions stay aligned.
             s = buf.get_iter_at_line(ln)[1]
             e = s.copy()
             e.forward_to_line_end()
-            return s, e, buf.get_text(s, e, False)
+            chars = []
+            it = s.copy()
+            while it.compare(e) < 0:
+                chars.append(it.get_char())
+                it.forward_char()
+            return s, e, ''.join(chars)
 
         has = False
         kind_re = self._KIND_RES[kind]
@@ -1448,8 +1465,18 @@ button.symbol-btn {
         self._insert_rel(rel, it)
 
     def _on_body_key(self, _c, keyval, _code, state):
-        if keyval == Gdk.KEY_v and state & Gdk.ModifierType.CONTROL_MASK:
+        ctrl = state & Gdk.ModifierType.CONTROL_MASK
+        if keyval == Gdk.KEY_v and ctrl:
             self._paste()
+            return True
+        if ctrl and keyval in (Gdk.KEY_z, Gdk.KEY_Z):
+            if state & Gdk.ModifierType.SHIFT_MASK:
+                self._history_redo()
+            else:
+                self._history_undo()
+            return True
+        if ctrl and keyval == Gdk.KEY_y:
+            self._history_redo()
             return True
         return False
 
